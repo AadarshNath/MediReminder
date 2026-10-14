@@ -24,7 +24,7 @@ object GeminiVisionApiClient {
         val base64Image = uriToBase64Jpeg(context, imageUri) ?: return@withContext null
 
         try {
-            val urlString = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$apiKey"
+            val urlString = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$apiKey"
             val url = URL(urlString)
 
             val prompt = """
@@ -73,6 +73,8 @@ object GeminiVisionApiClient {
                 connectTimeout = 8000
                 readTimeout = 8000
                 setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("X-goog-api-key", apiKey)
+                setRequestProperty("x-api-key", apiKey)
                 doOutput = true
             }
 
@@ -139,9 +141,12 @@ object GeminiVisionApiClient {
                         }
                     }
                 }
+            } else {
+                val errText = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                Log.e("GeminiVisionApi", "Gemini API HTTP Error ${connection.responseCode}: $errText")
             }
-        } catch (_: Exception) {
-            // Graceful fallback on network timeout or invalid API key
+        } catch (e: Exception) {
+            Log.e("GeminiVisionApi", "Gemini API Exception: ${e.localizedMessage}", e)
         }
         null
     }
