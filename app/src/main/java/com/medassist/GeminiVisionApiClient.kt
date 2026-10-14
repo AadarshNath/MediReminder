@@ -24,7 +24,7 @@ object GeminiVisionApiClient {
         val base64Image = uriToBase64Jpeg(context, imageUri) ?: return@withContext null
 
         try {
-            val urlString = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$apiKey"
+            val urlString = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=$apiKey"
             val url = URL(urlString)
 
             val prompt = """
@@ -128,14 +128,14 @@ object GeminiVisionApiClient {
                                             quantity = 1,
                                             isDatabaseVerified = true,
                                             genericSalt = "",
-                                            apiSource = "Gemini 1.5 AI"
+                                            apiSource = "Gemini 3.8 AI"
                                         )
                                     )
                                 }
                             }
 
                             if (resultList.isNotEmpty()) {
-                                Log.d("GeminiVisionApi", "Gemini 1.5 Flash AI Vision successfully parsed ${resultList.size} medicines")
+                                Log.d("GeminiVisionApi", "Gemini 3.8 Flash AI Vision successfully parsed ${resultList.size} medicines")
                                 return@withContext resultList
                             }
                         }
