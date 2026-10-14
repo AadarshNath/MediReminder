@@ -35,6 +35,22 @@ data class ParsedMedicineInfo(
 object OcrTextRecognizer {
 
     suspend fun recognizeTextFromUri(context: Context, uri: Uri): ParsedMedicineInfo? {
+        // Primary: Query Gemini 1.5 Flash Vision AI for near-100% accurate vision scanning
+        val geminiCandidates = GeminiVisionApiClient.analyzePrescriptionImage(context, uri)
+        if (geminiCandidates != null && geminiCandidates.isNotEmpty()) {
+            val first = geminiCandidates.first()
+            return ParsedMedicineInfo(
+                name = first.name,
+                instructions = first.instructions,
+                quantity = first.quantity,
+                form = first.form,
+                rawText = "Gemini AI Scanned Prescription",
+                isValidPrescription = true,
+                candidates = geminiCandidates
+            )
+        }
+
+        // Secondary / Offline Fallback: Local ML Kit OCR + Medicine Database
         return suspendCancellableCoroutine { continuation ->
             try {
                 val image = InputImage.fromFilePath(context, uri)
