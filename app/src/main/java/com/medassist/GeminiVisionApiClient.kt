@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -132,6 +133,7 @@ object GeminiVisionApiClient {
                             }
 
                             if (resultList.isNotEmpty()) {
+                                Log.d("GeminiVisionApi", "Gemini 1.5 Flash AI Vision successfully parsed ${resultList.size} medicines")
                                 return@withContext resultList
                             }
                         }
