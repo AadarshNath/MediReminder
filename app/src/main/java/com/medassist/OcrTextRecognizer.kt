@@ -6,8 +6,21 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
+
+data class ScannedMedicineCandidate(
+    val name: String,
+    val instructions: String,
+    val form: MedForm,
+    val quantity: Int = 1,
+    val isDatabaseVerified: Boolean = false,
+    val genericSalt: String = "",
+    val apiSource: String = "Local DB",
+)
 
 data class ParsedMedicineInfo(
     val name: String = "",
@@ -15,6 +28,8 @@ data class ParsedMedicineInfo(
     val quantity: Int = 1,
     val form: MedForm = MedForm.Pill,
     val rawText: String = "",
+    val isValidPrescription: Boolean = false,
+    val candidates: List<ScannedMedicineCandidate> = emptyList(),
 )
 
 object OcrTextRecognizer {
@@ -27,8 +42,10 @@ object OcrTextRecognizer {
 
                 recognizer.process(image)
                     .addOnSuccessListener { visionText ->
-                        val parsed = parsePrescriptionText(visionText)
-                        continuation.resume(parsed)
+                        CoroutineScope(Dispatchers.Default).launch {
+                            val parsed = parsePrescriptionText(visionText)
+                            continuation.resume(parsed)
+                        }
                     }
                     .addOnFailureListener {
                         continuation.resume(null)
@@ -39,82 +56,284 @@ object OcrTextRecognizer {
         }
     }
 
-    private fun parsePrescriptionText(visionText: Text): ParsedMedicineInfo {
-        val rawText = visionText.text
-        if (rawText.isBlank()) return ParsedMedicineInfo()
+    private data class LineInfo(
+        val text: String,
+        val top: Int,
+        val left: Int,
+    )
 
-        val lines = visionText.textBlocks.flatMap { block ->
+    private suspend fun parsePrescriptionText(visionText: Text): ParsedMedicineInfo {
+        val rawText = visionText.text
+        if (rawText.isBlank()) return ParsedMedicineInfo(isValidPrescription = false)
+
+        // Extract lines with bounding box positions to reconstruct row reading order
+        val lineItems = visionText.textBlocks.flatMap { block ->
+            block.lines
+        }.mapNotNull { line ->
+            val text = line.text.trim()
+            val box = line.boundingBox
+            if (text.isNotBlank() && box != null) {
+                LineInfo(text = text, top = box.top, left = box.left)
+            } else null
+        }
+
+        val sortedLines = mutableListOf<String>()
+        if (lineItems.isNotEmpty()) {
+            val groupedRows = lineItems.groupBy { lineInfo ->
+                lineInfo.top / 24
+            }.entries.sortedBy { it.key }
+
+            for (row in groupedRows) {
+                val rowText = row.value.sortedBy { it.left }.joinToString(" ") { it.text }
+                if (rowText.isNotBlank()) {
+                    sortedLines.add(rowText.trim())
+                }
+            }
+        }
+
+        val lines = if (sortedLines.isNotEmpty()) sortedLines else visionText.textBlocks.flatMap { block ->
             block.lines.map { it.text.trim() }
         }.filter { it.isNotBlank() }
 
-        var detectedName = ""
-        var detectedInstructions = ""
-        var detectedForm = MedForm.Pill
-        var detectedQuantity = 1
+        if (lines.isEmpty()) return ParsedMedicineInfo(rawText = rawText, isValidPrescription = false)
 
-        val skipKeywords = listOf(
-            "pharmacy", "rx", "doctor", "dr.", "patient", "date", "phone", "address",
-            "refill", "qty", "quantity", "tablets", "capsules", "caution", "keep out",
-            "store", "take", "sig", "dispense", "npi", "dea", "prov"
+        val lowerText = rawText.lowercase()
+
+        // Explicit non-medical terms (e.g. store receipts, invoices)
+        val nonMedicalKeywords = listOf(
+            "receipt", "subtotal", "total $", "amount due", "invoice", "cashier",
+            "checkout", "payment method", "card ending", "visa", "mastercard",
+            "thank you for shopping", "balance due"
         )
 
-        for (line in lines) {
-            val lowerLine = line.lowercase()
+        // Medical/Prescription terms & abbreviations
+        val medicalIndicators = listOf(
+            "rx", "dr", "doctor", "clinic", "hospital", "patient", "pt", "pharmacy",
+            "tab", "tablet", "tablets", "cap", "capsule", "capsules", "pill", "pills",
+            "syr", "syrup", "syp", "susp", "suspension", "inj", "injection", "vial",
+            "drop", "drops", "inhaler", "ointment", "cream", "powder", "dose", "dosage",
+            "mg", "mcg", "ml", "g", "iu", "tsp", "tbsp", "take", "sig", "qty", "quantity",
+            "refill", "dispense", "daily", "day", "days", "night", "morning", "evening",
+            "after", "before", "meal", "food", "bedtime", "1-0-1", "0-0-1", "1-1-1", "1-0-0",
+            "od", "bd", "bid", "tid", "tds", "qid", "hs", "sos", "po", "prn", "stat", "med", "medicine",
+            "treatment", "limcee", "shelcal", "zincovit", "paracetamol", "montelukast", "azithromycin", "sinarest"
+        )
 
-            // 1. Detect Form (Pill, Syrup, Injection, Drops, Inhaler, Powder)
-            when {
-                lowerLine.contains("capsule") || lowerLine.contains("cap") ||
-                    lowerLine.contains("tablet") || lowerLine.contains("tab") ||
-                    lowerLine.contains("pill") -> detectedForm = MedForm.Pill
-                lowerLine.contains("syrup") || lowerLine.contains("suspension") || lowerLine.contains("liquid") -> detectedForm = MedForm.Syrup
-                lowerLine.contains("injection") || lowerLine.contains("vial") -> detectedForm = MedForm.Injection
-                lowerLine.contains("drop") -> detectedForm = MedForm.Drops
-                lowerLine.contains("inhaler") -> detectedForm = MedForm.Inhaler
-                lowerLine.contains("powder") -> detectedForm = MedForm.Powder
+        val containsMedicalIndicator = medicalIndicators.any { indicator ->
+            if (indicator.length <= 2) {
+                lowerText.contains(Regex("(?i)\\b$indicator\\b"))
+            } else {
+                lowerText.contains(indicator)
+            }
+        } || lowerText.contains(Regex("(?i)\\b\\d+\\s*(mg|mcg|ml|g|iu)\\b"))
+          || lowerText.contains(Regex("\\b[0-1]-[0-1]-[0-1]\\b"))
+
+        val isExplicitNonMedical = nonMedicalKeywords.any { lowerText.contains(it) } && !containsMedicalIndicator
+
+        val isValidPrescription = containsMedicalIndicator || (!isExplicitNonMedical && lines.isNotEmpty())
+        if (!isValidPrescription) {
+            return ParsedMedicineInfo(rawText = rawText, isValidPrescription = false)
+        }
+
+        val ignoreSectionHeaderKeywords = listOf(
+            "investigation", "investigations", "cbp", "crp", "ct chest", "ct scan",
+            "x-ray", "ecg", "mri", "blood test", "monitoring", "pulse oxymeter",
+            "warning", "spo2", "fever", "breathless", "consult", "home care",
+            "treatment", "advice", "sunshine", "hospitals", "hospital", "physician",
+            "date", "page", "phone", "address", "dr.", "dr", "doctor", "patient", "pt name",
+            "clinic", "diagnosis", "age", "sex", "gender", "signature", "reg no", "receipt",
+            "subtotal", "total", "invoice", "tel", "dengue", "antigen", "rt pcr", "rtpcr",
+            "fever profile", "cbc", "esr", "cue", "widal", "sgpt", "smear", "steam inhalation",
+            "inhalation", "isolate", "cold water", "hospitalised", "symptoms", "saturation",
+            "lab test", "lab tests", "laboratory", "drug allergies", "allergies", "doctor's advice",
+            "doctors advice", "follow up", "follow-up", "description"
+        )
+
+        val candidates = mutableListOf<ScannedMedicineCandidate>()
+
+        val freqKeywords = listOf(
+            "twice a day", "once a day", "thrice a day", "once at night",
+            "once daily", "twice daily", "thrice daily", "once a week",
+            "twice a week", "as per physician", "daily", "every day",
+            "after meal", "before meal", "after food", "before food",
+            "after meals", "before meals", "1-0-1", "0-0-1", "1-1-1", "1-0-0",
+            "0-1-0", "bd", "tds", "qid", "od", "hs", "sos", "stat"
+        )
+
+        var inNonMedicineSection = false
+
+        for (line in lines) {
+            val lowerLine = line.lowercase().trim()
+
+            // Check if we entered a non-medicine section (e.g. Lab Test, Doctor's Advice, Follow Up)
+            if (lowerLine.contains("lab test") || lowerLine.contains("doctor's advice") ||
+                lowerLine.contains("doctors advice") || lowerLine.contains("drug allergies") ||
+                lowerLine.contains("follow up") || lowerLine.contains("description")) {
+                if (!lowerLine.contains("tablet") && !lowerLine.contains("1-0-1")) {
+                    inNonMedicineSection = true
+                    continue
+                }
             }
 
-            // 2. Detect Name (Look for uppercase words or lines with dosage like 500mg, 10mg)
-            if (detectedName.isEmpty()) {
-                val isSkip = skipKeywords.any { lowerLine.contains(it) }
-                if (!isSkip && line.length in 3..40) {
-                    // Check if line contains a dosage pattern (e.g., 500mg, 10 mg, 5ml) or strong word
-                    if (line.contains(Regex("(?i)\\b\\d+\\s*(mg|g|mcg|ml|iu)\\b")) || line.any { it.isUpperCase() }) {
-                        detectedName = line
+            // Reset section if we enter Prescribed Medicines or Treatment
+            if (lowerLine.contains("prescribed medicine") || lowerLine.contains("treatment") || lowerLine.contains("rx")) {
+                inNonMedicineSection = false
+                continue
+            }
+
+            if (inNonMedicineSection) {
+                continue
+            }
+
+            // Skip lab test lines or known header keywords
+            val isIgnoredHeader = ignoreSectionHeaderKeywords.any { header ->
+                lowerLine.startsWith(header) || lowerLine == header || (lowerLine.contains(" $header ") && !lowerLine.contains("mg") && !lowerLine.contains("ml"))
+            }
+            if (isIgnoredHeader && !lowerLine.contains("twice") && !lowerLine.contains("once") && !lowerLine.contains("thrice") && !lowerLine.contains("1-0-1")) {
+                continue
+            }
+
+            // Check if line looks like a medicine entry
+            val hasNumBullet = lowerLine.matches(Regex("^[0-9]+[.)]\\s*.*"))
+            val hasFormPrefix = lowerLine.contains(Regex("(?i)\\b(t\\.|tab|tab\\.|cap|cap\\.|syr|syr\\.|syp|inj|inj\\.|capsule|tablet|syrup|injection)\\b"))
+            val hasFrequency = freqKeywords.any { lowerLine.contains(it) }
+            val hasDosageMetric = lowerLine.contains(Regex("(?i)\\b\\d+(\\.\\d+)?\\s*(mg|g|mcg|ml|iu|mEq)\\b"))
+
+            if (hasNumBullet || hasFormPrefix || hasFrequency || hasDosageMetric) {
+                // Determine Form
+                val form = when {
+                    lowerLine.contains("syr") || lowerLine.contains("syp") || lowerLine.contains("syrup") -> MedForm.Syrup
+                    lowerLine.contains("inj") || lowerLine.contains("injection") || lowerLine.contains("vial") -> MedForm.Injection
+                    lowerLine.contains("drop") -> MedForm.Drops
+                    lowerLine.contains("inhaler") -> MedForm.Inhaler
+                    lowerLine.contains("powder") -> MedForm.Powder
+                    else -> MedForm.Pill
+                }
+
+                // Clean up prefix (e.g. "1. TABLET SINAREST 100MG" -> "SINAREST 100MG")
+                var cleanedLine = line.replace(Regex("^[0-9]+[.)]\\s*"), "").trim()
+                cleanedLine = cleanedLine.replace(Regex("(?i)\\b(tablets?|capsules?|syrups?|injections?|tab|cap|syr|syp|inj)\\b\\.?\\s*"), "").trim()
+                cleanedLine = cleanedLine.replace(Regex("(?i)^[tcsi]\\.\\s*"), "").trim()
+
+                var matchedInstruction = ""
+                var nameOnly = cleanedLine
+
+                for (freq in freqKeywords) {
+                    val idx = nameOnly.lowercase().indexOf(freq)
+                    if (idx != -1) {
+                        matchedInstruction = nameOnly.substring(idx).trim()
+                        nameOnly = nameOnly.substring(0, idx).trim()
+                        break
+                    }
+                }
+
+                nameOnly = nameOnly.trim().trimEnd('-', ',', '.', ' ', ':')
+
+                val sanitizedName = sanitizeMedicineName(nameOnly)
+                val isNameIgnored = ignoreSectionHeaderKeywords.any { it.equals(sanitizedName, ignoreCase = true) }
+
+                // Database Fuzzy Matching Lookup
+                val dbMatch = MedicineDatabase.findBestMatch(line) ?: MedicineDatabase.findBestMatch(sanitizedName)
+
+                var finalName: String
+                var finalForm: MedForm
+                var isVerified: Boolean
+                var genericSalt: String
+                var apiSource: String
+
+                if (dbMatch != null) {
+                    if (dbMatch.isBrandMatch) {
+                        val brand = dbMatch.entity.brandName
+                        val str = dbMatch.matchedStrength
+                        finalName = if (str.isNotEmpty() && !brand.lowercase().contains(str.lowercase())) "$brand $str" else brand
+                    } else {
+                        finalName = sanitizedName.ifEmpty { dbMatch.entity.genericSalt }
+                    }
+                    finalForm = dbMatch.entity.defaultForm
+                    isVerified = true
+                    genericSalt = dbMatch.entity.genericSalt
+                    apiSource = "Local DB"
+                } else {
+                    // Query free Online APIs (OpenFDA & RxNorm) as online fallback
+                    val onlineMatch = OnlineMedicineApiClient.searchOnline(sanitizedName)
+                    if (onlineMatch != null) {
+                        finalName = onlineMatch.candidate.name
+                        finalForm = onlineMatch.candidate.form
+                        isVerified = true
+                        genericSalt = onlineMatch.candidate.genericSalt
+                        apiSource = onlineMatch.apiSource
+                    } else {
+                        finalName = sanitizedName
+                        finalForm = form
+                        isVerified = false
+                        genericSalt = ""
+                        apiSource = "Local DB"
+                    }
+                }
+
+                if (finalName.length >= 2 && !isNameIgnored) {
+                    if (candidates.none { it.name.equals(finalName, ignoreCase = true) }) {
+                        candidates.add(
+                            ScannedMedicineCandidate(
+                                name = finalName,
+                                instructions = matchedInstruction.ifEmpty { "Take as directed" },
+                                form = finalForm,
+                                quantity = 1,
+                                isDatabaseVerified = isVerified,
+                                genericSalt = genericSalt,
+                                apiSource = apiSource
+                            )
+                        )
                     }
                 }
             }
-
-            // 3. Detect Instructions
-            if (detectedInstructions.isEmpty()) {
-                if (lowerLine.contains("take") || lowerLine.contains("after") ||
-                    lowerLine.contains("before") || lowerLine.contains("daily") ||
-                    lowerLine.contains("every") || lowerLine.contains("times") ||
-                    lowerLine.contains("morning") || lowerLine.contains("night") || lowerLine.contains("meal")
-                ) {
-                    detectedInstructions = line
-                }
-            }
-
-            // 4. Detect Dose Quantity (e.g. Take 1 tablet, Qty: 2)
-            if (lowerLine.contains("take") || lowerLine.contains("qty")) {
-                val digitMatch = Regex("\\b([1-9])\\b").find(line)
-                if (digitMatch != null) {
-                    detectedQuantity = digitMatch.groupValues[1].toIntOrNull() ?: 1
-                }
-            }
         }
 
-        // Fallback for name if none detected
-        if (detectedName.isEmpty() && lines.isNotEmpty()) {
-            detectedName = lines.firstOrNull { l -> skipKeywords.none { l.lowercase().contains(it) } } ?: lines.first()
-        }
+        val firstCandidate = candidates.firstOrNull()
 
         return ParsedMedicineInfo(
-            name = detectedName.trim(),
-            instructions = detectedInstructions.trim().ifEmpty { "Take as directed" },
-            quantity = detectedQuantity,
-            form = detectedForm,
+            name = firstCandidate?.name ?: "",
+            instructions = firstCandidate?.instructions ?: "Take as directed",
+            quantity = firstCandidate?.quantity ?: 1,
+            form = firstCandidate?.form ?: MedForm.Pill,
             rawText = rawText,
+            isValidPrescription = true,
+            candidates = candidates,
         )
+    }
+
+    private fun sanitizeMedicineName(rawName: String): String {
+        var name = rawName
+
+        val noisePatterns = listOf(
+            "(?i)\\bfilm[- ]coated\\b",
+            "(?i)\\bfilm[- ]c\\b",
+            "(?i)\\bdihydrate\\b",
+            "(?i)\\bmonohydrate\\b",
+            "(?i)\\bhydrochloride\\b",
+            "(?i)\\bhcl\\b",
+            "(?i)\\bip\\b",
+            "(?i)\\bbp\\b",
+            "(?i)\\busp\\b",
+            "(?i)\\b1\\s*tab\\b",
+            "(?i)\\b1\\s*cap\\b",
+            "(?i)\\btablets?\\b",
+            "(?i)\\bcapsules?\\b",
+            "(?i)\\bsyrup\\b",
+            "(?i)\\binjection\\b",
+            "(?i)\\bdispersible\\b",
+            "(?i)\\bsustained\\s*release\\b",
+            "(?i)\\bsr\\b",
+            "(?i)\\ber\\b",
+            "(?i)\\bxl\\b"
+        )
+
+        for (pattern in noisePatterns) {
+            name = name.replace(Regex(pattern), "")
+        }
+
+        name = name.replace(Regex("\\s+"), " ").trim().trimEnd('-', ',', '.', ' ', ':')
+
+        return name.ifEmpty { rawName }
     }
 }

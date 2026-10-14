@@ -253,6 +253,16 @@ fun MedAssistApp(dataManager: DataManager) {
         AlarmScheduler.scheduleNextAlarm(context, med)
     }
 
+    fun saveMultiple(list: List<Medicine>) {
+        list.forEach { med ->
+            val i = medicines.indexOfFirst { it.id == med.id }
+            if (i >= 0) medicines[i] = med else medicines.add(med)
+            AlarmScheduler.scheduleNextAlarm(context, med)
+        }
+        persistMedicines()
+        dataManager.saveNextId(nextId)
+    }
+
     fun delete(id: Int) {
         medicines.removeAll { it.id == id }
         persistMedicines()
@@ -357,8 +367,14 @@ fun MedAssistApp(dataManager: DataManager) {
         MedicineFormScreen(
             draft = draft,
             isNew = isNew,
+            nextId = nextId,
             onSave = {
                 save(it)
+                editing = null
+            },
+            onSaveMultiple = { list ->
+                saveMultiple(list)
+                nextId += list.size
                 editing = null
             },
             onDelete = {

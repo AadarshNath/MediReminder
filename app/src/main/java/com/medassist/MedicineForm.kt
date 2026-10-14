@@ -1,20 +1,24 @@
 package com.medassist
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -27,9 +31,16 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.DocumentScanner
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.PhotoCamera
+import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Schedule
+import androidx.compose.material.icons.outlined.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
@@ -60,16 +71,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import kotlinx.coroutines.launch
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import kotlinx.coroutines.launch
 
 private val isoFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
     timeZone = TimeZone.getTimeZone("UTC")
@@ -92,17 +107,29 @@ private fun prettyDate(iso: String): String = try {
     iso
 }
 
+private fun formatTime12(time24: String): String {
+    val parts = time24.split(":")
+    val hour = parts.getOrNull(0)?.toIntOrNull() ?: 8
+    val minute = parts.getOrNull(1)?.toIntOrNull() ?: 0
+    val amPm = if (hour >= 12) "PM" else "AM"
+    val h12 = if (hour % 12 == 0) 12 else hour % 12
+    return "%d:%02d %s".format(h12, minute, amPm)
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun MedicineFormScreen(
     draft: Medicine,
     isNew: Boolean,
+    nextId: Int = 100,
     onSave: (Medicine) -> Unit,
+    onSaveMultiple: ((List<Medicine>) -> Unit)? = null,
     onDelete: (Int) -> Unit,
     onCancel: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
     val scope = rememberCoroutineScope()
     var isScanning by remember { mutableStateOf(false) }
 
@@ -114,26 +141,131 @@ fun MedicineFormScreen(
     var stockError by remember { mutableStateOf(false) }
     var showTimePicker by remember { mutableStateOf(false) }
     var showDatePicker by remember { mutableStateOf(false) }
+    var showScanOptionDialog by remember { mutableStateOf(false) }
+    var showScanWarningDialog by remember { mutableStateOf(false) }
+    var showCandidateSelectionDialog by remember { mutableStateOf(false) }
+    var scannedCandidates by remember { mutableStateOf<List<ScannedMedicineCandidate>>(emptyList()) }
+    var selectedCandidateIndices by remember { mutableStateOf<Set<Int>>(emptySet()) }
+    var tempPhotoUri by remember { mutableStateOf<Uri?>(null) }
 
-    val photoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) {
-            isScanning = true
-            scope.launch {
-                val parsedInfo = OcrTextRecognizer.recognizeTextFromUri(context, uri)
-                isScanning = false
-                if (parsedInfo != null) {
+    fun selectCandidate(candidate: ScannedMedicineCandidate) {
+        form = form.copy(
+            name = candidate.name.ifEmpty { form.name },
+            form = candidate.form,
+            reason = candidate.instructions.ifEmpty { form.reason },
+            quantity = candidate.quantity,
+        )
+        quantityStr = candidate.quantity.toString()
+        nameError = false
+        showCandidateSelectionDialog = false
+    }
+
+    fun saveSelectedCandidates() {
+        val selectedCandidates = scannedCandidates.filterIndexed { index, _ -> index in selectedCandidateIndices }
+        if (selectedCandidates.isEmpty()) return
+
+        if (selectedCandidates.size == 1) {
+            selectCandidate(selectedCandidates.first())
+        } else {
+            val medicineList = selectedCandidates.mapIndexed { index, candidate ->
+                draft.copy(
+                    id = nextId + index,
+                    name = candidate.name,
+                    form = candidate.form,
+                    reason = candidate.instructions,
+                    quantity = candidate.quantity,
+                    stock = 30,
+                    refillAt = 5,
+                )
+            }
+            showCandidateSelectionDialog = false
+            if (onSaveMultiple != null) {
+                onSaveMultiple(medicineList)
+            } else {
+                selectCandidate(selectedCandidates.first())
+            }
+        }
+    }
+
+    fun processOcrUri(uri: Uri) {
+        isScanning = true
+        scope.launch {
+            val parsedInfo = OcrTextRecognizer.recognizeTextFromUri(context, uri)
+            isScanning = false
+            if (parsedInfo != null && parsedInfo.isValidPrescription) {
+                if (parsedInfo.candidates.size > 1) {
+                    scannedCandidates = parsedInfo.candidates
+                    selectedCandidateIndices = parsedInfo.candidates.indices.toSet()
+                    showCandidateSelectionDialog = true
+                } else if (parsedInfo.candidates.size == 1) {
+                    selectCandidate(parsedInfo.candidates.first())
+                } else if (parsedInfo.name.isNotEmpty()) {
                     form = form.copy(
-                        name = parsedInfo.name.ifEmpty { form.name },
+                        name = parsedInfo.name,
                         form = parsedInfo.form,
                         reason = parsedInfo.instructions.ifEmpty { form.reason },
                         quantity = parsedInfo.quantity,
                     )
                     quantityStr = parsedInfo.quantity.toString()
                     nameError = false
+                } else {
+                    showScanWarningDialog = true
                 }
+            } else {
+                showScanWarningDialog = true
             }
+        }
+    }
+
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            processOcrUri(uri)
+        }
+    }
+
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture()
+    ) { success ->
+        if (success && tempPhotoUri != null) {
+            processOcrUri(tempPhotoUri!!)
+        }
+    }
+
+    fun launchCamera() {
+        try {
+            val tempFile = File.createTempFile("ocr_scan_", ".jpg", context.cacheDir).apply {
+                createNewFile()
+                deleteOnExit()
+            }
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                tempFile
+            )
+            tempPhotoUri = uri
+            takePictureLauncher.launch(uri)
+        } catch (e: Exception) {
+            Toast.makeText(context, "Could not open camera: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            launchCamera()
+        } else {
+            Toast.makeText(context, "Camera permission is required to take a photo", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun onTakeCameraPhoto() {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            launchCamera()
+        } else {
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
     }
 
@@ -194,11 +326,7 @@ fun MedicineFormScreen(
                     verticalArrangement = Arrangement.spacedBy(18.dp),
                 ) {
                     OutlinedCard(
-                        onClick = {
-                            photoPickerLauncher.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
-                        },
+                        onClick = { showScanOptionDialog = true },
                         modifier = Modifier.fillMaxWidth(),
                         shape = MaterialTheme.shapes.large,
                     ) {
@@ -242,11 +370,7 @@ fun MedicineFormScreen(
                                 )
                             } else {
                                 TextButton(
-                                    onClick = {
-                                        photoPickerLauncher.launch(
-                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                        )
-                                    }
+                                    onClick = { showScanOptionDialog = true }
                                 ) {
                                     Text("Scan")
                                 }
@@ -262,9 +386,7 @@ fun MedicineFormScreen(
                         },
                         label = { Text("Medicine name *") },
                         isError = nameError,
-                        supportingText = if (nameError) {
-                            { Text("Please enter a medicine name", color = cs.error) }
-                        } else null,
+                        supportingText = { if (nameError) Text("Name is required") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -298,132 +420,70 @@ fun MedicineFormScreen(
                         types.forEachIndexed { index, t ->
                             SegmentedButton(
                                 selected = form.frequency.type == t,
-                                onClick = { form = form.copy(frequency = form.frequency.copy(type = t)) },
-                                shape = SegmentedButtonDefaults.itemShape(index, types.size),
+                                onClick = {
+                                    form = form.copy(frequency = form.frequency.copy(type = t))
+                                },
+                                shape = SegmentedButtonDefaults.itemShape(index = index, count = types.size),
                             ) {
                                 Text(t.short)
                             }
                         }
                     }
 
-                    if (form.frequency.type == FrequencyType.Weekdays) {
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            weekdayNames.forEach { day ->
-                                val selected = day in form.frequency.daysOfWeek
-                                FilterChip(
-                                    selected = selected,
-                                    onClick = {
-                                        val next = if (selected) {
-                                            form.frequency.daysOfWeek - day
-                                        } else {
-                                            form.frequency.daysOfWeek + day
-                                        }
-                                        form = form.copy(frequency = form.frequency.copy(daysOfWeek = next))
-                                    },
-                                    label = { Text(day) },
-                                )
-                            }
-                        }
-                    }
-
-                    if (form.frequency.type == FrequencyType.Interval) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            OutlinedTextField(
-                                value = form.frequency.interval.toString(),
-                                onValueChange = { v ->
-                                    val n = v.filter { it.isDigit() }.toIntOrNull() ?: 1
-                                    form = form.copy(frequency = form.frequency.copy(interval = n.coerceAtLeast(1)))
-                                },
-                                label = { Text("Every") },
-                                singleLine = true,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                modifier = Modifier.width(110.dp),
-                            )
-                            SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) {
-                                val units = IntervalUnit.entries
-                                units.forEachIndexed { index, u ->
-                                    SegmentedButton(
-                                        selected = form.frequency.unit == u,
-                                        onClick = { form = form.copy(frequency = form.frequency.copy(unit = u)) },
-                                        shape = SegmentedButtonDefaults.itemShape(index, units.size),
-                                    ) {
-                                        Text(u.label)
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
                         PickerField(
                             label = "Start date",
                             value = prettyDate(form.startDate),
-                            icon = { Icon(Icons.Outlined.CalendarMonth, contentDescription = null, modifier = Modifier.size(20.dp)) },
+                            icon = { Icon(Icons.Outlined.CalendarMonth, contentDescription = null, tint = cs.primary) },
                             modifier = Modifier.weight(1f),
                             onClick = { showDatePicker = true },
                         )
                         PickerField(
                             label = "Time",
-                            value = formatTimeFull(form.time24),
-                            icon = { Icon(Icons.Outlined.Schedule, contentDescription = null, modifier = Modifier.size(20.dp)) },
+                            value = formatTime12(form.time24),
+                            icon = { Icon(Icons.Outlined.Schedule, contentDescription = null, tint = cs.primary) },
                             modifier = Modifier.weight(1f),
                             onClick = { showTimePicker = true },
                         )
                     }
 
-                    OutlinedTextField(
-                        value = quantityStr,
-                        onValueChange = { v ->
-                            val digits = v.filter { it.isDigit() }
-                            quantityStr = digits
-                            if (digits.isNotEmpty()) {
-                                form = form.copy(quantity = (digits.toIntOrNull() ?: 1).coerceAtLeast(1))
-                            }
-                        },
-                        label = { Text("Quantity per dose") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    SectionLabel("Inventory")
+                    Row(
                         modifier = Modifier.fillMaxWidth(),
-                    )
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        OutlinedTextField(
+                            value = quantityStr,
+                            onValueChange = { quantityStr = it },
+                            label = { Text("Quantity per dose") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         OutlinedTextField(
                             value = stockStr,
-                            onValueChange = { v ->
-                                val digits = v.filter { it.isDigit() }
-                                stockStr = digits
-                                if (digits.isNotEmpty()) {
-                                    stockError = false
-                                    form = form.copy(stock = digits.toIntOrNull() ?: 0)
-                                }
+                            onValueChange = {
+                                stockStr = it
+                                if (it.isNotBlank()) stockError = false
                             },
                             label = { Text("Amount left *") },
                             isError = stockError,
-                            supportingText = if (stockError) {
-                                { Text("Please enter amount left", color = cs.error) }
-                            } else null,
-                            singleLine = true,
+                            supportingText = { if (stockError) Text("Required") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true,
                             modifier = Modifier.weight(1f),
                         )
+
                         OutlinedTextField(
                             value = refillAtStr,
-                            onValueChange = { v ->
-                                val digits = v.filter { it.isDigit() }
-                                refillAtStr = digits
-                                if (digits.isNotEmpty()) {
-                                    form = form.copy(refillAt = digits.toIntOrNull() ?: 0)
-                                }
-                            },
+                            onValueChange = { refillAtStr = it },
                             label = { Text("Refill at") },
-                            singleLine = true,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true,
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -471,7 +531,7 @@ fun MedicineFormScreen(
             initialMinute = parts.getOrNull(1)?.toIntOrNull() ?: 0,
             is24Hour = false,
         )
-        androidx.compose.material3.AlertDialog(
+        AlertDialog(
             onDismissRequest = { showTimePicker = false },
             confirmButton = {
                 TextButton(onClick = {
@@ -502,6 +562,302 @@ fun MedicineFormScreen(
         ) {
             DatePicker(state = dateState)
         }
+    }
+
+    if (showScanOptionDialog) {
+        AlertDialog(
+            onDismissRequest = { showScanOptionDialog = false },
+            title = {
+                Text(
+                    "Scan Prescription / Label",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        "Choose how you want to scan your medicine label:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    OutlinedCard(
+                        onClick = {
+                            showScanOptionDialog = false
+                            onTakeCameraPhoto()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            Icon(
+                                Icons.Outlined.PhotoCamera,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(28.dp)
+                            )
+                            Column {
+                                Text(
+                                    "Take Photo",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    "Use camera to scan physical label",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    OutlinedCard(
+                        onClick = {
+                            showScanOptionDialog = false
+                            photoPickerLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            Icon(
+                                Icons.Outlined.PhotoLibrary,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(28.dp)
+                            )
+                            Column {
+                                Text(
+                                    "Choose from Gallery",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    "Select existing photo from device",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showScanOptionDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showScanWarningDialog) {
+        AlertDialog(
+            onDismissRequest = { showScanWarningDialog = false },
+            icon = {
+                Icon(
+                    Icons.Outlined.Warning,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(36.dp)
+                )
+            },
+            title = {
+                Text(
+                    "Scan Not Completed",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Text(
+                    "The scanned document does not appear to be a valid doctor's prescription or medicine label. Please scan the correct prescription.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = { showScanWarningDialog = false },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    )
+                ) {
+                    Text("OK")
+                }
+            }
+        )
+    }
+
+    if (showCandidateSelectionDialog) {
+        AlertDialog(
+            onDismissRequest = { showCandidateSelectionDialog = false },
+            title = {
+                Column {
+                    Text(
+                        "Select Medicines (${selectedCandidateIndices.size}/${scannedCandidates.size})",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Check medicines to add simultaneously, or tap ✏️ to edit:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(
+                            onClick = {
+                                selectedCandidateIndices = if (selectedCandidateIndices.size == scannedCandidates.size) {
+                                    emptySet()
+                                } else {
+                                    scannedCandidates.indices.toSet()
+                                }
+                            }
+                        ) {
+                            Text(if (selectedCandidateIndices.size == scannedCandidates.size) "Deselect All" else "Select All")
+                        }
+                    }
+
+                    scannedCandidates.forEachIndexed { index, candidate ->
+                        val isChecked = index in selectedCandidateIndices
+                        OutlinedCard(
+                            onClick = {
+                                selectedCandidateIndices = if (isChecked) {
+                                    selectedCandidateIndices - index
+                                } else {
+                                    selectedCandidateIndices + index
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            border = if (isChecked) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else CardDefaults.outlinedCardBorder()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Checkbox(
+                                    checked = isChecked,
+                                    onCheckedChange = { checked ->
+                                        selectedCandidateIndices = if (checked) {
+                                            selectedCandidateIndices + index
+                                        } else {
+                                            selectedCandidateIndices - index
+                                        }
+                                    }
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(38.dp)
+                                        .background(
+                                            if (candidate.isDatabaseVerified) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                            shape = MaterialTheme.shapes.medium
+                                        ),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        candidate.form.label.take(1),
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (candidate.isDatabaseVerified) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text(
+                                            candidate.name,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.weight(1f, fill = false)
+                                        )
+                                        if (candidate.isDatabaseVerified) {
+                                            Text(
+                                                "✓ Verified (${candidate.apiSource})",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.primary,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        if (candidate.genericSalt.isNotEmpty()) "${candidate.genericSalt} • ${candidate.instructions}" else "${candidate.form.label} • ${candidate.instructions}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { selectCandidate(candidate) }
+                                ) {
+                                    Icon(
+                                        Icons.Outlined.Edit,
+                                        contentDescription = "Edit medicine details",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(4.dp))
+                    TextButton(
+                        onClick = {
+                            val searchQuery = scannedCandidates.firstOrNull()?.name ?: "prescription medicine"
+                            uriHandler.openUri("https://www.google.com/search?q=" + Uri.encode(searchQuery))
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Search Online for Medicine Info")
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = { saveSelectedCandidates() },
+                    enabled = selectedCandidateIndices.isNotEmpty()
+                ) {
+                    Text("Add Selected (${selectedCandidateIndices.size})")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCandidateSelectionDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
