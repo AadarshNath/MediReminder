@@ -13,7 +13,7 @@ data class ParsedMedicineInfo(
     val name: String = "",
     val instructions: String = "",
     val quantity: Int = 1,
-    val form: MedForm = MedForm.Tablet,
+    val form: MedForm = MedForm.Pill,
     val rawText: String = "",
 )
 
@@ -33,7 +33,7 @@ object OcrTextRecognizer {
                     .addOnFailureListener {
                         continuation.resume(null)
                     }
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 continuation.resume(null)
             }
         }
@@ -49,7 +49,7 @@ object OcrTextRecognizer {
 
         var detectedName = ""
         var detectedInstructions = ""
-        var detectedForm = MedForm.Tablet
+        var detectedForm = MedForm.Pill
         var detectedQuantity = 1
 
         val skipKeywords = listOf(
@@ -61,16 +61,16 @@ object OcrTextRecognizer {
         for (line in lines) {
             val lowerLine = line.lowercase()
 
-            // 1. Detect Form (Tablet, Capsule, Syrup, etc.)
+            // 1. Detect Form (Pill, Syrup, Injection, Drops, Inhaler, Powder)
             when {
-                lowerLine.contains("capsule") || lowerLine.contains("cap") -> detectedForm = MedForm.Capsule
+                lowerLine.contains("capsule") || lowerLine.contains("cap") ||
+                    lowerLine.contains("tablet") || lowerLine.contains("tab") ||
+                    lowerLine.contains("pill") -> detectedForm = MedForm.Pill
                 lowerLine.contains("syrup") || lowerLine.contains("suspension") || lowerLine.contains("liquid") -> detectedForm = MedForm.Syrup
                 lowerLine.contains("injection") || lowerLine.contains("vial") -> detectedForm = MedForm.Injection
                 lowerLine.contains("drop") -> detectedForm = MedForm.Drops
-                lowerLine.contains("ointment") || lowerLine.contains("cream") -> detectedForm = MedForm.Ointment
                 lowerLine.contains("inhaler") -> detectedForm = MedForm.Inhaler
-                lowerLine.contains("patch") -> detectedForm = MedForm.Patch
-                lowerLine.contains("tablet") || lowerLine.contains("tab") || lowerLine.contains("pill") -> detectedForm = MedForm.Tablet
+                lowerLine.contains("powder") -> detectedForm = MedForm.Powder
             }
 
             // 2. Detect Name (Look for uppercase words or lines with dosage like 500mg, 10mg)
