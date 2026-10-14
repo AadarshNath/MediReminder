@@ -24,7 +24,7 @@ object GeminiVisionApiClient {
         val base64Image = uriToBase64Jpeg(context, imageUri) ?: return@withContext null
 
         try {
-            val urlString = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$apiKey"
+            val urlString = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$apiKey"
             val url = URL(urlString)
 
             val prompt = """
