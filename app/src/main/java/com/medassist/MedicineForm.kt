@@ -1,5 +1,8 @@
 package com.medassist
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,9 +26,11 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.DocumentScanner
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -50,9 +55,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -62,6 +69,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import kotlinx.coroutines.launch
 
 private val isoFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
     timeZone = TimeZone.getTimeZone("UTC")
@@ -94,6 +102,10 @@ fun MedicineFormScreen(
     onCancel: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var isScanning by remember { mutableStateOf(false) }
+
     var form by remember(draft.id) { mutableStateOf(draft) }
     var quantityStr by remember(draft.id) { mutableStateOf(draft.quantity.toString()) }
     var stockStr by remember(draft.id) { mutableStateOf(if (isNew && draft.name.isEmpty()) "" else draft.stock.toString()) }
@@ -102,6 +114,28 @@ fun MedicineFormScreen(
     var stockError by remember { mutableStateOf(false) }
     var showTimePicker by remember { mutableStateOf(false) }
     var showDatePicker by remember { mutableStateOf(false) }
+
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            isScanning = true
+            scope.launch {
+                val parsedInfo = OcrTextRecognizer.recognizeTextFromUri(context, uri)
+                isScanning = false
+                if (parsedInfo != null) {
+                    form = form.copy(
+                        name = parsedInfo.name.ifEmpty { form.name },
+                        form = parsedInfo.form,
+                        reason = parsedInfo.instructions.ifEmpty { form.reason },
+                        quantity = parsedInfo.quantity,
+                    )
+                    quantityStr = parsedInfo.quantity.toString()
+                    nameError = false
+                }
+            }
+        }
+    }
 
     fun submitSave() {
         var hasError = false
@@ -159,6 +193,67 @@ fun MedicineFormScreen(
                         .padding(horizontal = 20.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(18.dp),
                 ) {
+                    OutlinedCard(
+                        onClick = {
+                            photoPickerLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.large,
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    Icons.Outlined.DocumentScanner,
+                                    contentDescription = null,
+                                    tint = cs.primary,
+                                    modifier = Modifier.size(28.dp),
+                                )
+                                Column {
+                                    Text(
+                                        "Scan Prescription / Label",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = cs.onSurface,
+                                    )
+                                    Text(
+                                        "Auto-fill details using ML Kit OCR",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = cs.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                            if (isScanning) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(24.dp),
+                                    strokeWidth = 2.dp,
+                                    color = cs.primary
+                                )
+                            } else {
+                                TextButton(
+                                    onClick = {
+                                        photoPickerLauncher.launch(
+                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                        )
+                                    }
+                                ) {
+                                    Text("Scan")
+                                }
+                            }
+                        }
+                    }
+
                     OutlinedTextField(
                         value = form.name,
                         onValueChange = {
