@@ -24,6 +24,9 @@ class AlarmReceiver : BroadcastReceiver() {
         val dm = DataManager(context)
         val medicine = dm.loadMedicines().find { it.id == medicineId } ?: return
 
+        // Trigger spoken voice reminder out loud
+        VoiceReminderManager.speakReminder(context, medicine.name, medicine.reason, medicine.quantity)
+
         // Launch full-screen intent
         val fullScreenIntent = Intent(context, AlarmActivity::class.java).apply {
             putExtra("MEDICINE_ID", medicineId)

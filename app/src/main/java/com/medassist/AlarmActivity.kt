@@ -68,6 +68,7 @@ class AlarmActivity : ComponentActivity() {
             return
         }
 
+        VoiceReminderManager.speakReminder(this, medicine.name, medicine.reason, medicine.quantity)
         playAlarmSound()
 
         setContent {
@@ -137,6 +138,7 @@ class AlarmActivity : ComponentActivity() {
     }
 
     private fun stopAlarmSound() {
+        VoiceReminderManager.stop()
         mediaPlayer?.stop()
         mediaPlayer?.release()
         mediaPlayer = null
