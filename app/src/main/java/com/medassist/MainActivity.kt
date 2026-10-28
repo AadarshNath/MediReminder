@@ -48,6 +48,7 @@ import androidx.compose.material.icons.outlined.Medication
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material.icons.outlined.SmartToy
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -338,6 +339,8 @@ fun MedAssistApp(dataManager: DataManager) {
                     medicines = medicines,
                     onEdit = { editing = it }
                 )
+            } else if (tab == "AI Chat") {
+                MedicineChatScreen(activeMedicines = medicines)
             } else if (tab == "Profile") {
                 ProfileScreen(
                     profile = userProfile,
@@ -931,6 +934,7 @@ private fun BottomNav(current: String, onSelect: (String) -> Unit) {
     val items = listOf(
         "Today" to Icons.Outlined.Home,
         "Medicine" to Icons.Outlined.Medication,
+        "AI Chat" to Icons.Outlined.SmartToy,
         "Profile" to Icons.Outlined.Person,
     )
     NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
